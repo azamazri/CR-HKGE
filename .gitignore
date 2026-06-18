@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Runtime outputs
+Log/
+logs/
+weights/
+artifacts/
+final_study/
+ablation/
+corrected_baselines/
+nosim_experiment/
+
+# Large/generated archives
+*.zip
+*.tar
+*.tar.gz
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
