@@ -35,6 +35,11 @@ class CFKG(object):
         self.L1_flag = args.l1_flag
 
         self.lr = args.lr
+        # Optimizer for the TransE objective. Original code hard-coded plain SGD,
+        # which left CFKG's near-zero result an optimizer artifact while every other
+        # baseline used Adam. Default to Adam at the shared lr; 'sgd' restores the
+        # legacy behaviour for comparison.
+        self.optimizer = getattr(args, 'cfkg_optimizer', 'adam')
         # settings for CF part.
         self.emb_dim = args.embed_size
         self.batch_size = args.batch_size
@@ -139,7 +144,10 @@ class CFKG(object):
         self.loss = self.kge_loss + self.reg_loss
 
         # Optimization process.
-        self.opt = tf.train.GradientDescentOptimizer(learning_rate=self.lr).minimize(self.loss)
+        if self.optimizer == 'sgd':
+            self.opt = tf.train.GradientDescentOptimizer(learning_rate=self.lr).minimize(self.loss)
+        else:
+            self.opt = tf.train.AdamOptimizer(learning_rate=self.lr).minimize(self.loss)
 
     def _statistics_params(self):
         # number of params

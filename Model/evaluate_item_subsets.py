@@ -246,9 +246,9 @@ def print_result(name: str, result, n_users: int, n_pos: int):
 
 
 def main():
-    tf.set_random_seed(2019)
-    np.random.seed(2019)
     args = parse_args()
+    tf.set_random_seed(args.seed)
+    np.random.seed(args.seed)
 
     data_generator = build_loader(args)
     config = build_config(args, data_generator)

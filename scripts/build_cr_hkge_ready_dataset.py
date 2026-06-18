@@ -26,6 +26,35 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SOURCE = ROOT / "dataset-aromatique-kgat-ready"
 DEFAULT_OUTPUT = ROOT / "dataset-aromatique-crhkge-ready"
+DEFAULT_HOLDOUT_OUTPUT = ROOT / "dataset-aromatique-crhkge-holdout"
+
+# Hold-out protocol (circularity-breaking evaluation).
+#
+# The positive-pair labels in this dataset are scored from KG relations. Three of
+# those relations encode the DIRECT cross-reference path that the labels reward:
+#   - inspired_by                 (product -> global reference parfum)
+#   - has_global_accord           (global reference -> global accord)
+#   - belongs_to_global_family    (global reference -> global family)
+# Training a KG model on exactly these edges and then testing it on labels built
+# from the same edges is circular. In `--holdout_mode` we DELETE these direct
+# edges from the TRAINING graph (`kg_final.txt`) while leaving the INDIRECT
+# content relations intact:
+#   - has_accord, has_visual_note, belongs_to_family, sem_similar
+# The labels (`train.txt` / `test.txt`) are NOT changed: they are still scored
+# from the full source KG, so the held-out run is directly comparable to the full
+# run and measures whether the model can recover cross-reference proximity WITHOUT
+# having seen the direct paths.
+HOLDOUT_DIRECT_RELATIONS = (
+    "inspired_by",
+    "has_global_accord",
+    "belongs_to_global_family",
+)
+HOLDOUT_KEEP_RELATIONS = (
+    "has_accord",
+    "has_visual_note",
+    "belongs_to_family",
+    "sem_similar",
+)
 
 COPY_FILES = [
     "entity2id.txt",
@@ -272,6 +301,54 @@ def split_ranked_candidates(
     return train_rows, test_rows
 
 
+def apply_holdout_filter(
+    kg_path: Path,
+    relation_by_id: dict[int, str],
+    remove_relations: tuple[str, ...],
+) -> dict[str, object]:
+    """Rewrite ``kg_path`` in place, removing edges of the given relation names.
+
+    Only the TRAINING graph (``kg_final.txt``) is altered. Returns audit info on
+    exactly which relations / how many edges were removed vs kept.
+    """
+    name_to_id = {name: rel_id for rel_id, name in relation_by_id.items()}
+    remove_ids = {}
+    for name in remove_relations:
+        if name not in name_to_id:
+            raise ValueError(
+                "holdout relation %r not found in relation2id.txt (have: %s)"
+                % (name, ", ".join(sorted(name_to_id)))
+            )
+        remove_ids[name] = name_to_id[name]
+
+    removed_per_relation: dict[str, int] = {name: 0 for name in remove_relations}
+    kept_lines: list[str] = []
+    total = 0
+    for line in kg_path.read_text(encoding="utf-8-sig").splitlines():
+        if not line.strip():
+            continue
+        total += 1
+        _head, relation_id, _tail = (int(part) for part in line.split())
+        relation_name = relation_by_id.get(relation_id)
+        if relation_name in remove_ids:
+            removed_per_relation[relation_name] += 1
+        else:
+            kept_lines.append(line)
+
+    kg_path.write_text("\n".join(kept_lines) + "\n", encoding="utf-8")
+
+    n_removed = sum(removed_per_relation.values())
+    return {
+        "holdout_mode": True,
+        "removed_relations": list(remove_relations),
+        "removed_relation_ids": {name: remove_ids[name] for name in remove_relations},
+        "removed_edges_per_relation": removed_per_relation,
+        "n_edges_total_full_kg": total,
+        "n_edges_removed": n_removed,
+        "n_edges_kept_training_kg": len(kept_lines),
+    }
+
+
 def write_interaction_file(path: Path, rows: dict[int, list[int]]) -> None:
     lines = []
     for profile_id in sorted(rows):
@@ -381,6 +458,19 @@ def build_dataset(args: argparse.Namespace) -> dict[str, object]:
         encoding="utf-8",
     )
 
+    # Hold-out protocol: the labels above are already written and are IDENTICAL to
+    # the full-KG run (they were scored from the full source KG). We only now prune
+    # the TRAINING graph so the model never sees the direct cross-reference edges.
+    holdout_info: dict[str, object]
+    if getattr(args, "holdout_mode", False):
+        holdout_info = apply_holdout_filter(
+            output / "kg_final.txt",
+            relation_by_id,
+            HOLDOUT_DIRECT_RELATIONS,
+        )
+    else:
+        holdout_info = {"holdout_mode": False}
+
     all_train_items = {item for items in train_rows.values() for item in items}
     all_test_items = {item for items in test_rows.values() for item in items}
     enriched_products = [product_id for product_id, feature in features.items() if feature.is_enriched]
@@ -388,6 +478,7 @@ def build_dataset(args: argparse.Namespace) -> dict[str, object]:
         "source_dataset": source.name,
         "output_dataset": output.name,
         "construction": "cr_hkge_aligned_content_positive_pairs",
+        "holdout": holdout_info,
         "profile_semantics": "one content/query profile per source product",
         "n_products": len(products),
         "n_profiles": len(train_rows),
@@ -414,10 +505,29 @@ def build_dataset(args: argparse.Namespace) -> dict[str, object]:
     (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 
     readme = [
-        "# dataset-aromatique-crhkge-ready",
+        "# %s" % output.name,
         "",
         "Dataset ini dibuat oleh `scripts/build_cr_hkge_ready_dataset.py`.",
         "",
+    ]
+    if holdout_info.get("holdout_mode"):
+        readme += [
+            "## HOLD-OUT MODE (circularity-breaking)",
+            "",
+            "`kg_final.txt` di sini adalah TRAINING GRAPH yang sudah dipangkas: edge",
+            "cross-reference langsung (%s) DIHAPUS, sedangkan relasi konten tidak"
+            % ", ".join(str(r) for r in holdout_info["removed_relations"]),
+            "langsung (%s) tetap dipertahankan." % ", ".join(HOLDOUT_KEEP_RELATIONS),
+            "",
+            "- Edge dihapus total: %d (dari %d edge full KG)."
+            % (holdout_info["n_edges_removed"], holdout_info["n_edges_total_full_kg"]),
+            "- Edge tersisa untuk training: %d." % holdout_info["n_edges_kept_training_kg"],
+            "- `train.txt`/`test.txt` IDENTIK dengan dataset full-KG (label tidak diubah).",
+            "- Saat evaluasi subset, gunakan `--cr_subset_dataset dataset-aromatique-crhkge-ready`",
+            "  agar definisi enriched/standard tetap berasal dari KG penuh.",
+            "",
+        ]
+    readme += [
         "Tujuan utamanya adalah menyelaraskan `train.txt` dan `test.txt` dengan tiga novelty CR-HKGE:",
         "",
         "1. Fragrance-specific heterogeneous KG construction.",
@@ -445,12 +555,35 @@ def build_dataset(args: argparse.Namespace) -> dict[str, object]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-dataset", default=str(DEFAULT_SOURCE))
-    parser.add_argument("--output-dataset", default=str(DEFAULT_OUTPUT))
+    parser.add_argument(
+        "--output-dataset",
+        default=None,
+        help=(
+            "Output dataset folder. Defaults to %s, or %s when --holdout_mode is set."
+            % (DEFAULT_OUTPUT.name, DEFAULT_HOLDOUT_OUTPUT.name)
+        ),
+    )
     parser.add_argument("--train-per-profile", type=int, default=8)
     parser.add_argument("--test-per-profile", type=int, default=4)
     parser.add_argument("--min-score", type=float, default=0.01)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--holdout_mode",
+        action="store_true",
+        help=(
+            "Circularity-breaking hold-out: remove the DIRECT cross-reference edges "
+            "(%s) from the TRAINING kg_final.txt while keeping the indirect content "
+            "relations (%s). Labels (train.txt/test.txt) are unchanged so the run is "
+            "comparable to the full-KG control."
+            % (", ".join(HOLDOUT_DIRECT_RELATIONS), ", ".join(HOLDOUT_KEEP_RELATIONS))
+        ),
+    )
     args = parser.parse_args()
+
+    if args.output_dataset is None:
+        args.output_dataset = str(
+            DEFAULT_HOLDOUT_OUTPUT if args.holdout_mode else DEFAULT_OUTPUT
+        )
 
     summary = build_dataset(args)
     print(json.dumps(summary, indent=2))

@@ -21,6 +21,9 @@ def parse_args():
                         help='0: No pretrain, -1: Pretrain with the learned embeddings, 1:Pretrain with stored models.')
     parser.add_argument('--verbose', type=int, default=1,
                         help='Interval of evaluation.')
+    parser.add_argument('--seed', type=int, default=2019,
+                        help='Random seed for tf / numpy / random. Vary this across runs '
+                             '(e.g. 2019..2023) to estimate mean +/- std of every metric.')
     parser.add_argument('--epoch', type=int, default=100,
                         help='Number of epoch.')
 
@@ -77,6 +80,11 @@ def parse_args():
     
     parser.add_argument('--l1_flag', type=bool, default=True,
                         help='Flase: using the L2 norm, True: using the L1 norm.')
+
+    parser.add_argument('--cfkg_optimizer', nargs='?', default='adam',
+                        help='CFKG baseline only. Optimizer for the TransE loss: {adam, sgd}. '
+                             'Defaults to adam so CFKG matches every other model (BPRMF/CKE/NFM/KGAT/CR-HKGE) '
+                             'instead of the original plain SGD, whose near-zero result was an optimizer artifact.')
 
     parser.add_argument('--cr_use_relation_weight', type=int, default=1,
                         help='CR-HKGE only. 1: use relation-type specific attention weights, 0: disable.')

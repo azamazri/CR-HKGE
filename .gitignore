@@ -18,6 +18,7 @@ logs/
 weights/
 artifacts/
 final_study/
+holdout_study/
 ablation/
 corrected_baselines/
 nosim_experiment/

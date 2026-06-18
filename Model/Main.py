@@ -64,10 +64,13 @@ def _metric_value(ret, metric, target_k, k_values):
 
 if __name__ == '__main__':
     # get argument settings.
-    tf.set_random_seed(2019)
-    np.random.seed(2019)
-    rd.seed(2019)
     args = parse_args()
+
+    # Seed from the CLI so multi-seed runs (2019..2023) are reproducible and we can
+    # report mean +/- std per metric. Defaults to 2019 to match the original code.
+    tf.set_random_seed(args.seed)
+    np.random.seed(args.seed)
+    rd.seed(args.seed)
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
 

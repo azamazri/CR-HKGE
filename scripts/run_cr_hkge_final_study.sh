@@ -1,10 +1,37 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# =============================================================================
+# CR-HKGE final study (rewritten for fair, multi-seed comparison)
+#
+# Two correctness fixes vs the original script:
+#
+# 1. CONSISTENT ALPHA + SINGLE-FLAG ABLATIONS.
+#    The headline full model and every ablation now share ONE canonical flag
+#    stem (`cr_full_stem`). Each ablation is that stem with EXACTLY ONE flag
+#    flipped (appended override; argparse uses the last value). This removes the
+#    original confounds where:
+#      - the full model ran at alpha=0.5 although the paper reports alpha=0.1,
+#      - A_no_relation_attention also silently set relation_aware_message=0,
+#      - A_no_fragrance_prior / A_no_relation_message ran at alpha=0.5.
+#    Alpha is fixed at 0.1 for ALL variants (override with CR_ALPHA=...).
+#    cr_relation_aware_message stays 1 everywhere except A_no_relation_message.
+#
+# 2. MULTI-SEED. Every target is trained+evaluated once per seed in $SEEDS, and
+#    the results are aggregated to mean +/- std so significance is assessable.
+#
+# The exact flag that differs per variant is documented in IMPLEMENTATION_NOTES.md.
+# =============================================================================
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODEL_DIR="$ROOT_DIR/Model"
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/final_study/logs}"
 DATASET="${DATASET:-dataset-aromatique-kgat-ready}"
+
+# Shared, configurable cross-reference strength. 0.1 = paper's final model.
+CR_ALPHA="${CR_ALPHA:-0.1}"
+# Seeds to average over. Configurable via env var.
+SEEDS="${SEEDS:-2019 2020 2021 2022 2023}"
 
 mkdir -p "$LOG_DIR"
 
@@ -27,6 +54,25 @@ COMMON_ARGS=(
   --save_flag 1
 )
 
+# Canonical full CR-HKGE flag stem. ALL CR-HKGE variants below are built from
+# this exact string with at most one overriding flag appended, so every
+# comparison differs by a single component only.
+cr_full_stem() {
+  echo "--model_type cr_hkge \
+--cr_use_relation_weight 1 \
+--cr_use_cross_ref 1 \
+--cr_relation_weight_mode semantic \
+--cr_relation_prior_mode fragrance \
+--cr_relation_prior_strength 1.0 \
+--cr_relation_attention_scale type_count \
+--cr_relation_aware_message 1 \
+--cr_relation_message_scale type_count \
+--cr_cross_ref_bi_interaction 0 \
+--cr_cross_ref_gate 0 \
+--cr_cross_ref_alpha ${CR_ALPHA} \
+--cr_best_metric ndcg --cr_best_k 3"
+}
+
 model_args() {
   case "$1" in
     bprmf)
@@ -39,92 +85,40 @@ model_args() {
       echo "--model_type nfm"
       ;;
     cfkg)
+      # CFKG now defaults to Adam (parser default --cfkg_optimizer adam), matching
+      # every other model. Pass --cfkg_optimizer sgd to reproduce the legacy result.
       echo "--model_type cfkg"
       ;;
     kgat)
       echo "--model_type kgat"
       ;;
     cr_hkge_final)
-      # Model utama paper:
-      # semua komponen CR-HKGE aktif, yaitu relation-type attention,
-      # fragrance prior, relation-aware message, dan cross-reference.
-      echo "--model_type cr_hkge --cr_use_relation_weight 1 --cr_use_cross_ref 1 --cr_relation_weight_mode semantic --cr_relation_prior_mode fragrance --cr_relation_prior_strength 1.0 --cr_relation_attention_scale type_count --cr_relation_aware_message 1 --cr_relation_message_scale type_count --cr_cross_ref_bi_interaction 0 --cr_cross_ref_gate 0 --cr_cross_ref_alpha 0.5 --cr_best_metric ndcg --cr_best_k 3 --cr_export_embeddings 1 --cr_model_version cr_hkge_final_flow"
-      ;;
-    cr_hkge_final_alpha_0_25)
-      # Kandidat final: semua novelty tetap aktif, tetapi kekuatan
-      # cross-reference diturunkan. Dipakai ketika inspired_by membantu recall
-      # awal namun terlalu kuat menggeser ranking dari sinyal accord/family.
-      echo "--model_type cr_hkge --cr_use_relation_weight 1 --cr_use_cross_ref 1 --cr_relation_weight_mode semantic --cr_relation_prior_mode fragrance --cr_relation_prior_strength 1.0 --cr_relation_attention_scale type_count --cr_relation_aware_message 1 --cr_relation_message_scale type_count --cr_cross_ref_bi_interaction 0 --cr_cross_ref_gate 0 --cr_cross_ref_alpha 0.25 --cr_best_metric ndcg --cr_best_k 3 --cr_export_embeddings 1 --cr_model_version cr_hkge_final_alpha_0_25"
-      ;;
-    cr_hkge_final_alpha_0_1)
-      # Kandidat final: semua novelty tetap aktif dengan cross-reference sangat
-      # konservatif. Tujuannya menjaga manfaat inspired_by tanpa mengalahkan
-      # neighborhood KG utama.
-      echo "--model_type cr_hkge --cr_use_relation_weight 1 --cr_use_cross_ref 1 --cr_relation_weight_mode semantic --cr_relation_prior_mode fragrance --cr_relation_prior_strength 1.0 --cr_relation_attention_scale type_count --cr_relation_aware_message 1 --cr_relation_message_scale type_count --cr_cross_ref_bi_interaction 0 --cr_cross_ref_gate 0 --cr_cross_ref_alpha 0.1 --cr_best_metric ndcg --cr_best_k 3 --cr_export_embeddings 1 --cr_model_version cr_hkge_final_alpha_0_1"
-      ;;
-    cr_hkge_final_alpha_0_075)
-      # NFM-focus tuning: cross-reference lebih kecil dari alpha 0.1.
-      # Tujuannya menaikkan ketajaman ranking awal tanpa mematikan novelty
-      # inspired_by sepenuhnya.
-      echo "--model_type cr_hkge --cr_use_relation_weight 1 --cr_use_cross_ref 1 --cr_relation_weight_mode semantic --cr_relation_prior_mode fragrance --cr_relation_prior_strength 1.0 --cr_relation_attention_scale type_count --cr_relation_aware_message 1 --cr_relation_message_scale type_count --cr_cross_ref_bi_interaction 0 --cr_cross_ref_gate 0 --cr_cross_ref_alpha 0.075 --cr_best_metric ndcg --cr_best_k 3 --cr_export_embeddings 1 --cr_model_version cr_hkge_final_alpha_0_075"
-      ;;
-    cr_hkge_final_alpha_0_05)
-      # NFM-focus tuning: cross-reference dibuat sangat konservatif.
-      # Ini menguji apakah NDCG@3 membaik ketika sinyal local fragrance/KG
-      # kembali lebih dominan dibanding inspired_by.
-      echo "--model_type cr_hkge --cr_use_relation_weight 1 --cr_use_cross_ref 1 --cr_relation_weight_mode semantic --cr_relation_prior_mode fragrance --cr_relation_prior_strength 1.0 --cr_relation_attention_scale type_count --cr_relation_aware_message 1 --cr_relation_message_scale type_count --cr_cross_ref_bi_interaction 0 --cr_cross_ref_gate 0 --cr_cross_ref_alpha 0.05 --cr_best_metric ndcg --cr_best_k 3 --cr_export_embeddings 1 --cr_model_version cr_hkge_final_alpha_0_05"
-      ;;
-    cr_hkge_final_alpha_0_1_prior_0_5)
-      # NFM-focus tuning: alpha tetap 0.1, tetapi prior relasi fragrance
-      # dilemahkan agar relation attention tidak terlalu agresif.
-      echo "--model_type cr_hkge --cr_use_relation_weight 1 --cr_use_cross_ref 1 --cr_relation_weight_mode semantic --cr_relation_prior_mode fragrance --cr_relation_prior_strength 0.5 --cr_relation_attention_scale type_count --cr_relation_aware_message 1 --cr_relation_message_scale type_count --cr_cross_ref_bi_interaction 0 --cr_cross_ref_gate 0 --cr_cross_ref_alpha 0.1 --cr_best_metric ndcg --cr_best_k 3 --cr_export_embeddings 1 --cr_model_version cr_hkge_final_alpha_0_1_prior_0_5"
-      ;;
-    cr_hkge_final_alpha_0_1_prior_0_25)
-      # NFM-focus tuning: versi prior fragrance paling konservatif.
-      # Dipakai untuk mengecek apakah ranking awal lebih tajam saat prior
-      # relasi hanya menjadi bias ringan, bukan pendorong utama.
-      echo "--model_type cr_hkge --cr_use_relation_weight 1 --cr_use_cross_ref 1 --cr_relation_weight_mode semantic --cr_relation_prior_mode fragrance --cr_relation_prior_strength 0.25 --cr_relation_attention_scale type_count --cr_relation_aware_message 1 --cr_relation_message_scale type_count --cr_cross_ref_bi_interaction 0 --cr_cross_ref_gate 0 --cr_cross_ref_alpha 0.1 --cr_best_metric ndcg --cr_best_k 3 --cr_export_embeddings 1 --cr_model_version cr_hkge_final_alpha_0_1_prior_0_25"
-      ;;
-    cr_hkge_final_alpha_0_1_no_relation_message)
-      # NFM-focus tuning: relation attention tetap aktif pada skor KGE/attention,
-      # tetapi tidak mengalikan pesan adjacency. Ini mengurangi risiko relation
-      # prior mengganggu message passing yang sudah stabil.
-      echo "--model_type cr_hkge --cr_use_relation_weight 1 --cr_use_cross_ref 1 --cr_relation_weight_mode semantic --cr_relation_prior_mode fragrance --cr_relation_prior_strength 1.0 --cr_relation_attention_scale type_count --cr_relation_aware_message 0 --cr_relation_message_scale type_count --cr_cross_ref_bi_interaction 0 --cr_cross_ref_gate 0 --cr_cross_ref_alpha 0.1 --cr_best_metric ndcg --cr_best_k 3 --cr_export_embeddings 1 --cr_model_version cr_hkge_final_alpha_0_1_no_relation_message"
-      ;;
-    cr_hkge_final_alpha_0_075_prior_0_5)
-      # Kombinasi dua kalibrasi yang paling mungkin membantu NDCG: alpha 0.075
-      # dan prior fragrance 0.5.
-      echo "--model_type cr_hkge --cr_use_relation_weight 1 --cr_use_cross_ref 1 --cr_relation_weight_mode semantic --cr_relation_prior_mode fragrance --cr_relation_prior_strength 0.5 --cr_relation_attention_scale type_count --cr_relation_aware_message 1 --cr_relation_message_scale type_count --cr_cross_ref_bi_interaction 0 --cr_cross_ref_gate 0 --cr_cross_ref_alpha 0.075 --cr_best_metric ndcg --cr_best_k 3 --cr_export_embeddings 1 --cr_model_version cr_hkge_final_alpha_0_075_prior_0_5"
-      ;;
-    cr_hkge_final_gated)
-      # Kandidat final: semua novelty tetap aktif, tetapi kontribusi
-      # cross-reference dikontrol oleh gate trainable. Init -2.0 berarti
-      # kontribusi awal inspired_by kecil lalu dapat naik jika memang berguna.
-      echo "--model_type cr_hkge --cr_use_relation_weight 1 --cr_use_cross_ref 1 --cr_relation_weight_mode semantic --cr_relation_prior_mode fragrance --cr_relation_prior_strength 1.0 --cr_relation_attention_scale type_count --cr_relation_aware_message 1 --cr_relation_message_scale type_count --cr_cross_ref_bi_interaction 0 --cr_cross_ref_gate 1 --cr_cross_ref_gate_init -2.0 --cr_best_metric ndcg --cr_best_k 3 --cr_export_embeddings 1 --cr_model_version cr_hkge_final_gated"
+      # Headline model: full CR-HKGE stem, alpha=$CR_ALPHA (0.1 by default).
+      echo "$(cr_full_stem) --cr_export_embeddings 1 --cr_model_version cr_hkge_final_flow"
       ;;
     A_no_cross_reference)
-      # Ablation: menghapus Novelty cross-reference via inspired_by.
-      echo "--model_type cr_hkge --cr_use_relation_weight 1 --cr_use_cross_ref 0 --cr_relation_weight_mode semantic --cr_relation_prior_mode fragrance --cr_relation_prior_strength 1.0 --cr_relation_attention_scale type_count --cr_relation_aware_message 1 --cr_relation_message_scale type_count --cr_best_metric ndcg --cr_best_k 3"
+      # Ablation -> differs by ONE flag: cr_use_cross_ref (1 -> 0).
+      echo "$(cr_full_stem) --cr_use_cross_ref 0"
       ;;
     A_no_relation_attention)
-      # Ablation: menghapus relation-type attention, sehingga relasi fragrance
-      # tidak lagi mendapat bobot prioritas berbeda.
-      echo "--model_type cr_hkge --cr_use_relation_weight 0 --cr_use_cross_ref 1 --cr_relation_aware_message 0 --cr_cross_ref_bi_interaction 0 --cr_cross_ref_gate 0 --cr_cross_ref_alpha 0.5 --cr_best_metric ndcg --cr_best_k 3"
+      # Ablation -> differs by ONE flag: cr_use_relation_weight (1 -> 0).
+      # relation_aware_message stays 1 (held constant); it is a sub-feature of
+      # relation attention and is inert at the model level when weights are off.
+      echo "$(cr_full_stem) --cr_use_relation_weight 0"
       ;;
     A_no_relation_message)
-      # Ablation: relation attention tetap mempengaruhi skor attention,
-      # tetapi tidak mengalikan pesan adjacency per relasi.
-      echo "--model_type cr_hkge --cr_use_relation_weight 1 --cr_use_cross_ref 1 --cr_relation_weight_mode semantic --cr_relation_prior_mode fragrance --cr_relation_prior_strength 1.0 --cr_relation_attention_scale type_count --cr_relation_aware_message 0 --cr_relation_message_scale type_count --cr_cross_ref_bi_interaction 0 --cr_cross_ref_gate 0 --cr_cross_ref_alpha 0.5 --cr_best_metric ndcg --cr_best_k 3"
+      # Ablation -> differs by ONE flag: cr_relation_aware_message (1 -> 0).
+      # This is the ONLY variant that touches relation_aware_message.
+      echo "$(cr_full_stem) --cr_relation_aware_message 0"
       ;;
     A_no_fragrance_prior)
-      # Ablation: bobot relasi tetap learnable, tetapi inisialisasinya netral
-      # tanpa prior domain fragrance.
-      echo "--model_type cr_hkge --cr_use_relation_weight 1 --cr_use_cross_ref 1 --cr_relation_weight_mode semantic --cr_relation_prior_mode none --cr_relation_attention_scale type_count --cr_relation_aware_message 1 --cr_relation_message_scale type_count --cr_cross_ref_bi_interaction 0 --cr_cross_ref_gate 0 --cr_cross_ref_alpha 0.5 --cr_best_metric ndcg --cr_best_k 3"
+      # Ablation -> differs by ONE flag: cr_relation_prior_mode (fragrance -> none).
+      echo "$(cr_full_stem) --cr_relation_prior_mode none"
       ;;
     A_no_novelty_modules)
-      # Ablation paling dasar: semua novelty CR-HKGE dimatikan.
-      # Ini mendekati KGAT dengan wrapper CR-HKGE dan dipakai sebagai kontrol.
-      echo "--model_type cr_hkge --cr_use_relation_weight 0 --cr_use_cross_ref 0 --cr_relation_aware_message 0 --cr_best_metric ndcg --cr_best_k 3"
+      # Control (NOT a single-flag ablation, by design): all CR-HKGE novelties off,
+      # i.e. KGAT wrapped in the CR-HKGE code path. Three flags differ on purpose.
+      echo "$(cr_full_stem) --cr_use_relation_weight 0 --cr_use_cross_ref 0 --cr_relation_aware_message 0"
       ;;
     *)
       echo "unknown study target: $1" >&2
@@ -135,35 +129,37 @@ model_args() {
 
 run_target() {
   local target="$1"
-  local train_log="$LOG_DIR/${target}_train.log"
-  local eval_log="$LOG_DIR/${target}_subset_eval.log"
-  local weights_path="../final_study/${target}/"
-
   read -r -a extra_args <<< "$(model_args "$target")"
 
-  echo "==> Training $target"
-  # Setiap target dilatih dari awal dengan split dan hyperparameter yang sama
-  # agar perbandingan baseline, CR-HKGE, dan ablation tetap fair.
-  (
-    cd "$MODEL_DIR"
-    python Main.py \
-      --weights_path "$weights_path" \
-      "${COMMON_ARGS[@]}" \
-      "${extra_args[@]}"
-  ) 2>&1 | tee "$train_log"
+  for seed in $SEEDS; do
+    local tag="${target}_seed${seed}"
+    local train_log="$LOG_DIR/${tag}_train.log"
+    local eval_log="$LOG_DIR/${tag}_subset_eval.log"
+    # Per-seed weights dir so checkpoints never collide between seeds.
+    local weights_path="../final_study/${target}/seed_${seed}/"
 
-  echo "==> Evaluating $target"
-  (
-    cd "$MODEL_DIR"
-    python evaluate_item_subsets.py \
-      --weights_path "$weights_path" \
-      "${COMMON_ARGS[@]}" \
-      "${extra_args[@]}"
-  ) 2>&1 | tee "$eval_log"
+    echo "==> Training $target (seed=$seed)"
+    (
+      cd "$MODEL_DIR"
+      python Main.py \
+        --weights_path "$weights_path" \
+        --seed "$seed" \
+        "${COMMON_ARGS[@]}" \
+        "${extra_args[@]}"
+    ) 2>&1 | tee "$train_log"
 
-  echo "==> Finished $target"
-  echo "train_log=$train_log"
-  echo "eval_log=$eval_log"
+    echo "==> Evaluating $target (seed=$seed)"
+    (
+      cd "$MODEL_DIR"
+      python evaluate_item_subsets.py \
+        --weights_path "$weights_path" \
+        --seed "$seed" \
+        "${COMMON_ARGS[@]}" \
+        "${extra_args[@]}"
+    ) 2>&1 | tee "$eval_log"
+
+    echo "==> Finished $target (seed=$seed)"
+  done
 }
 
 if [ "$#" -eq 0 ]; then
@@ -188,4 +184,12 @@ for target in "${targets[@]}"; do
   run_target "$target"
 done
 
-python "$ROOT_DIR/scripts/summarize_final_study.py" "$LOG_DIR"/*_subset_eval.log | tee "$LOG_DIR/final_summary.md"
+# Per-seed flat table (one row per target+seed) for inspection ...
+python "$ROOT_DIR/scripts/summarize_final_study.py" "$LOG_DIR"/*_subset_eval.log \
+  | tee "$LOG_DIR/final_summary_per_seed.md"
+
+# ... and the aggregated mean +/- std table across seeds (the headline result).
+python "$ROOT_DIR/scripts/summarize_multiseed_study.py" \
+  --csv "$LOG_DIR/final_summary_meanstd.csv" \
+  "$LOG_DIR"/*_subset_eval.log \
+  | tee "$LOG_DIR/final_summary_meanstd.md"
