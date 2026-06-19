@@ -32,6 +32,9 @@ class CRHKGE(KGAT):
         self.cr_relation_prior_strength = float(getattr(args, 'cr_relation_prior_strength', 1.0))
         self.cr_relation_attention_scale = getattr(args, 'cr_relation_attention_scale', 'type_count')
         self.cr_relation_aware_message = bool(int(getattr(args, 'cr_relation_aware_message', 0)))
+        # Plan B: gated conditional enrichment. When on, standard products get the
+        # exact plain-KGAT update; only enriched products get the CR-HKGE treatment.
+        self.cr_planB_gate = bool(int(getattr(args, 'cr_planB_gate', 1)))
         self.cr_relation_message_scale = getattr(args, 'cr_relation_message_scale', 'type_count')
         self.cr_cross_ref_alpha = float(getattr(args, 'cr_cross_ref_alpha', 1.0))
         self.cr_cross_ref_bi_interaction = bool(int(getattr(args, 'cr_cross_ref_bi_interaction', 0)))
@@ -298,44 +301,129 @@ class CRHKGE(KGAT):
         relation_multiplier = self._relation_multiplier_for_r(r)
         return kg_score * relation_multiplier
 
+    def _build_kgat_attention_tensor(self):
+        # Plan B: pure-KGAT attentive adjacency, computed IN-GRAPH and therefore
+        # differentiable. This is the SAME attention plain KGAT uses -- it calls
+        # the BASE KGAT TransR score (KGAT._generate_transE_score), i.e. WITHOUT the
+        # CR-HKGE relation-type multiplier lambda_r. Standard products aggregate
+        # over this so their neighborhood is never reweighted by lambda_r.
+        cached = getattr(self, '_cr_kgat_A_tensor', None)
+        if cached is not None:
+            return cached
+
+        n_nodes = self.n_users + self.n_entities
+        h = tf.constant(np.asarray(self.all_h_list, dtype=np.int32))
+        t = tf.constant(np.asarray(self.all_t_list, dtype=np.int32))
+        r = tf.constant(np.asarray(self.all_r_list, dtype=np.int32))
+
+        # Explicitly call the BASE-class score (no lambda_r). CRHKGE overrides
+        # _generate_transE_score to multiply by the relation multiplier; we bypass
+        # that here so the standard branch is bit-for-bit plain KGAT.
+        pure_scores = KGAT._generate_transE_score(self, h=h, t=t, r=r)
+
+        indices = np.column_stack((self.all_h_list, self.all_t_list)).astype(np.int64)
+        sp_in = tf.SparseTensor(indices, pure_scores, [n_nodes, n_nodes])
+        self._cr_kgat_A_tensor = tf.sparse.softmax(sp_in)
+        return self._cr_kgat_A_tensor
+
+    def _standard_product_gate(self):
+        # Plan B gate g_std: 1.0 for STANDARD product nodes (item, no inspired_by),
+        # 0.0 for everything else (enriched products, users, non-product entities).
+        # Used as: side = side_CR + g_std * (side_KGAT - side_CR), so only standard
+        # products are switched to the plain-KGAT message; enriched products / users
+        # / entities keep the exact current CR-HKGE behaviour.
+        cached = getattr(self, '_cr_standard_gate_tensor', None)
+        if cached is not None:
+            return cached
+
+        n_nodes = self.n_users + self.n_entities
+        if not self.cr_planB_gate:
+            # Plan B disabled -> no node is forced to KGAT (legacy CR-HKGE).
+            self._cr_standard_gate_tensor = tf.constant(
+                np.zeros((n_nodes, 1), dtype=np.float32), dtype=tf.float32)
+            self._cr_standard_gate_np = np.zeros((n_nodes, 1), dtype=np.float32)
+            return self._cr_standard_gate_tensor
+        # Mask of product (item) nodes.
+        item_mask = np.zeros((n_nodes, 1), dtype=np.float32)
+        item_mask[self.n_users:self.n_users + self.n_items, 0] = 1.0
+        # Enriched product mask (1 for products that have inspired_by).
+        product_mask = self.cr_config.get('product_mask')
+        if product_mask is None:
+            product_mask = np.zeros((n_nodes, 1), dtype=np.float32)
+        product_mask = np.asarray(product_mask, dtype=np.float32).reshape((n_nodes, 1))
+        # standard product = item node AND NOT enriched.
+        standard_mask = item_mask * (1.0 - product_mask)
+        self._cr_standard_gate_tensor = tf.constant(standard_mask, dtype=tf.float32)
+        self._cr_standard_gate_np = standard_mask
+        return self._cr_standard_gate_tensor
+
+    def _kgat_reference_layer(self, ego_embeddings, kgat_A, k):
+        # One plain-KGAT bi-interaction layer using the pure attention. Used both as
+        # the standard-product branch and to materialise the invariant-check tensor.
+        side_embeddings = tf.sparse_tensor_dense_matmul(kgat_A, ego_embeddings)
+
+        add_embeddings = ego_embeddings + side_embeddings
+        sum_embeddings = tf.nn.leaky_relu(
+            tf.matmul(add_embeddings, self.weights['W_gc_%d' % k]) + self.weights['b_gc_%d' % k])
+
+        bi_embeddings = tf.multiply(ego_embeddings, side_embeddings)
+        bi_embeddings = tf.nn.leaky_relu(
+            tf.matmul(bi_embeddings, self.weights['W_bi_%d' % k]) + self.weights['b_bi_%d' % k])
+
+        ego_next = bi_embeddings + sum_embeddings
+        ego_next = tf.nn.dropout(ego_next, 1 - self.mess_dropout[k])
+        return ego_next
+
     def _create_bi_interaction_embed(self):
         if not self.cr_use_cross_ref and not self.cr_relation_aware_message:
             return super(CRHKGE, self)._create_bi_interaction_embed()
 
-        # Fase Layer 4:
-        # fungsi ini menggantikan bi-interaction KGAT ketika novelty CR-HKGE
-        # aktif. Struktur KGAT tetap dipertahankan, tetapi side embedding dapat
-        # diberi bobot relasi dan konteks cross-reference.
+        # Fase Layer 4 (Plan B: gated conditional enrichment):
+        # fungsi ini menggantikan bi-interaction KGAT ketika novelty CR-HKGE aktif.
+        # Untuk produk STANDARD (tanpa inspired_by), gate memaksa update menjadi
+        # identik dengan KGAT murni; produk ENRICHED tetap mendapat treatment CR-HKGE
+        # penuh. e_p = g_p * CR_update(p) + (1 - g_p) * KGAT_update(p), dengan
+        # g_p = 1 untuk enriched dan 0 untuk standard.
         A = self.A_in
         A_fold_hat = self._split_A_hat(A)
         relation_A_fold_hat = self._build_relation_aware_A_fold_hat()
+
+        # Plan B in-graph machinery.
+        kgat_A = self._build_kgat_attention_tensor()
+        standard_gate = self._standard_product_gate()        # (n_nodes, 1)
 
         ego_embeddings = tf.concat([self.weights['user_embed'], self.weights['entity_embed']], axis=0)
         all_embeddings = [ego_embeddings]
 
         for k in range(0, self.n_layers):
             if relation_A_fold_hat is not None:
-                # Jika relation-aware message aktif, setiap adjacency per
-                # relasi dihitung terpisah lalu dikalikan bobot tipe relasi.
-                side_embeddings = self._relation_aware_side_embeddings(
+                # CR side: relation-aware message (deviation c) + lambda_r weights.
+                side_cr = self._relation_aware_side_embeddings(
                     ego_embeddings,
                     relation_A_fold_hat)
             else:
-                # Jika relation-aware message tidak aktif, fallback ke agregasi
-                # KGAT biasa memakai attentive adjacency A_in.
+                # CR side fallback: lambda_r-weighted attentive adjacency A_in.
                 temp_embed = []
                 for f in range(self.n_fold):
                     temp_embed.append(tf.sparse_tensor_dense_matmul(A_fold_hat[f], ego_embeddings))
+                side_cr = tf.concat(temp_embed, 0)
 
-                side_embeddings = tf.concat(temp_embed, 0)
+            # KGAT side: pure attention (no lambda_r, no relation-aware message).
+            side_kgat = tf.sparse_tensor_dense_matmul(kgat_A, ego_embeddings)
+
+            # GATE the side message: standard products -> side_kgat, others -> side_cr.
+            # This neutralises BOTH deviation (b) lambda_r-on-attention and (c)
+            # relation-aware message for standard products in one differentiable op.
+            side_embeddings = side_cr + standard_gate * (side_kgat - side_cr)
 
             sum_side_embeddings = side_embeddings
             bi_side_embeddings = side_embeddings
             if self.cr_use_cross_ref:
-                # Fase Layer 3:
-                # konteks global reference ditambahkan ke branch additive.
-                # Produk tanpa inspired_by mendapat konteks nol karena mask.
+                # Deviation (a): cross-reference context. Already masked to enriched
+                # products via cr_product_mask_tensor; we additionally multiply by
+                # (1 - standard_gate) so standard products are *provably* unaffected.
                 cross_ref_context = self._create_cross_reference_context(ego_embeddings, k)
+                cross_ref_context = cross_ref_context * (1.0 - standard_gate)
                 sum_side_embeddings = side_embeddings + cross_ref_context
                 if self.cr_cross_ref_bi_interaction:
                     bi_side_embeddings = sum_side_embeddings
@@ -349,9 +437,17 @@ class CRHKGE(KGAT):
             bi_embeddings = tf.nn.leaky_relu(
                 tf.matmul(bi_embeddings, self.weights['W_bi_%d' % k]) + self.weights['b_bi_%d' % k])
 
-            ego_embeddings = bi_embeddings + sum_embeddings
-            ego_embeddings = tf.nn.dropout(ego_embeddings, 1 - self.mess_dropout[k])
+            ego_next = bi_embeddings + sum_embeddings
+            ego_next = tf.nn.dropout(ego_next, 1 - self.mess_dropout[k])
 
+            if k == 0:
+                # Invariant capture (layer 1, identical inputs for both streams):
+                # the gated update vs the pure-KGAT update from the SAME ego_0.
+                self.cr_dbg_gated_layer1 = ego_next
+                self.cr_dbg_kgat_layer1 = self._kgat_reference_layer(
+                    all_embeddings[0], kgat_A, 0)
+
+            ego_embeddings = ego_next
             norm_embeddings = tf.math.l2_normalize(ego_embeddings, axis=1)
             all_embeddings += [norm_embeddings]
 
@@ -427,6 +523,66 @@ class CRHKGE(KGAT):
         return (self.cr_cross_ref_alpha * self.cr_cross_ref_gate * inspired_multiplier *
                 transformed_context * self.cr_product_mask_tensor)
 
+    def check_standard_equals_kgat(self, sess, tol=1e-5, verbose=True):
+        """Plan B invariant check.
+
+        For STANDARD products (item nodes without inspired_by), the layer-1 gated
+        CR-HKGE update must equal the plain-KGAT update bit-for-bit (within fp
+        tolerance), given identical layer-0 inputs. Enriched products must differ
+        (sanity that the CR path is actually doing something). Returns a dict and
+        raises AssertionError if the invariant is violated.
+
+        Run with message dropout = 0 so dropout is the identity.
+        """
+        if not hasattr(self, 'cr_dbg_gated_layer1'):
+            raise RuntimeError(
+                'invariant tensors not built; this check requires the gated '
+                'CR-HKGE path (cr_use_cross_ref or cr_relation_aware_message on).')
+
+        feed = {
+            self.mess_dropout: [0.] * self.n_layers,
+            self.node_dropout: [0.] * self.n_layers,
+        }
+        gated, kgat_ref = sess.run(
+            [self.cr_dbg_gated_layer1, self.cr_dbg_kgat_layer1], feed_dict=feed)
+
+        enriched_items = set(int(i) for i in self.cr_config.get('enriched_product_ids', []))
+        standard_nodes = []
+        enriched_nodes = []
+        for item_id in range(self.n_items):
+            node = self.n_users + item_id
+            if item_id in enriched_items:
+                enriched_nodes.append(node)
+            else:
+                standard_nodes.append(node)
+
+        std_diff = 0.0
+        if standard_nodes:
+            std_diff = float(np.max(np.abs(gated[standard_nodes] - kgat_ref[standard_nodes])))
+        enr_diff = 0.0
+        if enriched_nodes:
+            enr_diff = float(np.max(np.abs(gated[enriched_nodes] - kgat_ref[enriched_nodes])))
+
+        result = {
+            'n_standard_products': len(standard_nodes),
+            'n_enriched_products': len(enriched_nodes),
+            'max_abs_diff_standard_vs_kgat': std_diff,
+            'max_abs_diff_enriched_vs_kgat': enr_diff,
+            'tolerance': tol,
+        }
+        if verbose:
+            print('[Plan B invariant] standard products: %d, enriched products: %d'
+                  % (len(standard_nodes), len(enriched_nodes)))
+            print('[Plan B invariant] max|gated - KGAT| on STANDARD = %.3e (must be <= %.1e)'
+                  % (std_diff, tol))
+            print('[Plan B invariant] max|gated - KGAT| on ENRICHED = %.3e (should be > 0)'
+                  % enr_diff)
+
+        assert std_diff <= tol, (
+            'Plan B invariant VIOLATED: standard products deviate from KGAT by %.3e > %.1e'
+            % (std_diff, tol))
+        return result
+
     def export_artifacts(self, sess, args, data_generator, final_perf):
         # Fase akhir setelah training:
         # export artifact untuk serving/retrieval dan integrasi dengan sistem
@@ -498,6 +654,7 @@ class CRHKGE(KGAT):
             'cr_relation_attention_scale': self.cr_relation_attention_scale,
             'cr_relation_aware_message': self.cr_relation_aware_message,
             'cr_relation_message_scale': self.cr_relation_message_scale,
+            'cr_planB_gate': self.cr_planB_gate,
             'cr_cross_ref_alpha': self.cr_cross_ref_alpha,
             'cr_cross_ref_bi_interaction': self.cr_cross_ref_bi_interaction,
             'cr_cross_ref_gate': self.cr_cross_ref_gate_enabled,

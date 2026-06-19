@@ -100,6 +100,11 @@ def parse_args():
                         help='CR-HKGE only. probability: use softmax lambda directly in attention scores; type_count: multiply by number of relation types so uniform lambda preserves KGAT score scale.')
     parser.add_argument('--cr_relation_aware_message', type=int, default=0,
                         help='CR-HKGE only. 1: apply relation weights to neighborhood message propagation, 0: keep KGAT propagation strict.')
+    parser.add_argument('--cr_planB_gate', type=int, default=1,
+                        help='CR-HKGE only (Plan B gated conditional enrichment). 1: STANDARD products '
+                             '(no inspired_by) receive EXACTLY the plain-KGAT update; only enriched products '
+                             'get the CR-HKGE treatment. 0: disable the gate (legacy CR-HKGE where lambda_r / '
+                             'relation-aware message also alter standard products).')
     parser.add_argument('--cr_relation_message_scale', nargs='?', default='type_count',
                         help='CR-HKGE only. probability: use softmax lambda directly for messages; type_count: multiply by number of relation types to preserve KGAT message scale.')
     parser.add_argument('--cr_cross_ref_alpha', type=float, default=1.0,
