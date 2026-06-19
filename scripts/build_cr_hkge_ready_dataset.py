@@ -302,25 +302,50 @@ def split_ranked_candidates(
 
 
 def apply_holdout_filter(
-    kg_path: Path,
+    output_dir: Path,
     relation_by_id: dict[int, str],
     remove_relations: tuple[str, ...],
 ) -> dict[str, object]:
-    """Rewrite ``kg_path`` in place, removing edges of the given relation names.
+    """Prune the TRAINING graph for the hold-out protocol.
 
-    Only the TRAINING graph (``kg_final.txt``) is altered. Returns audit info on
-    exactly which relations / how many edges were removed vs kept.
+    Removes edges of ``remove_relations`` from ``kg_final.txt`` AND **re-numbers
+    the surviving relations to contiguous ids 0..k-1**, writing a matching
+    ``relation2id.txt``. The whole KGAT/CR-HKGE stack assumes raw relation ids are
+    dense (the inverse-relation id is computed as ``r_id + 2 + raw_n_relations``,
+    and the relation-type arrays are sized ``len(adj_r_list)``). If we merely
+    deleted edges, the surviving ids would have gaps (e.g. id 0/5/6 missing) and
+    the relation-aware message would index past the type array -> IndexError.
+
+    The removed relation *names* are still listed in ``relation2id.txt`` but at ids
+    >= k (with zero edges), so CR-HKGE's name lookups (`inspired_by`,
+    `has_global_accord`, `belongs_to_global_family`) resolve to valid edge-less
+    ids -> enriched_products / global_attr edges correctly come out empty, which is
+    exactly the hold-out semantics, with no id collision against id 0.
+
+    Only the TRAINING graph + its relation2id are altered. Labels are untouched.
     """
     name_to_id = {name: rel_id for rel_id, name in relation_by_id.items()}
-    remove_ids = {}
+    remove_names = set()
     for name in remove_relations:
         if name not in name_to_id:
             raise ValueError(
                 "holdout relation %r not found in relation2id.txt (have: %s)"
                 % (name, ", ".join(sorted(name_to_id)))
             )
-        remove_ids[name] = name_to_id[name]
+        remove_names.add(name)
 
+    # Dense re-numbering: kept relations first (0..k-1, original order), then the
+    # removed names (k.., edge-less) so their names still resolve.
+    all_old_ids = sorted(relation_by_id)
+    kept_old_ids = [rid for rid in all_old_ids if relation_by_id[rid] not in remove_names]
+    removed_old_ids = [rid for rid in all_old_ids if relation_by_id[rid] in remove_names]
+    new_id_of: dict[int, int] = {}
+    for new_id, old_id in enumerate(kept_old_ids):
+        new_id_of[old_id] = new_id
+    for offset, old_id in enumerate(removed_old_ids):
+        new_id_of[old_id] = len(kept_old_ids) + offset
+
+    kg_path = output_dir / "kg_final.txt"
     removed_per_relation: dict[str, int] = {name: 0 for name in remove_relations}
     kept_lines: list[str] = []
     total = 0
@@ -328,24 +353,38 @@ def apply_holdout_filter(
         if not line.strip():
             continue
         total += 1
-        _head, relation_id, _tail = (int(part) for part in line.split())
+        head, relation_id, tail = (int(part) for part in line.split())
         relation_name = relation_by_id.get(relation_id)
-        if relation_name in remove_ids:
+        if relation_name in remove_names:
             removed_per_relation[relation_name] += 1
         else:
-            kept_lines.append(line)
+            # Re-number the surviving relation to keep the id space dense.
+            kept_lines.append("%d %d %d" % (head, new_id_of[relation_id], tail))
 
     kg_path.write_text("\n".join(kept_lines) + "\n", encoding="utf-8")
+
+    # Rewrite relation2id.txt to match the dense numbering (all names retained).
+    rel_lines = [str(len(relation_by_id))]
+    for old_id in sorted(new_id_of, key=lambda o: new_id_of[o]):
+        rel_lines.append("%s\t%d" % (relation_by_id[old_id], new_id_of[old_id]))
+    (output_dir / "relation2id.txt").write_text(
+        "\n".join(rel_lines) + "\n", encoding="utf-8"
+    )
 
     n_removed = sum(removed_per_relation.values())
     return {
         "holdout_mode": True,
         "removed_relations": list(remove_relations),
-        "removed_relation_ids": {name: remove_ids[name] for name in remove_relations},
+        "removed_relation_ids_in_full_kg": {name: name_to_id[name] for name in remove_relations},
         "removed_edges_per_relation": removed_per_relation,
         "n_edges_total_full_kg": total,
         "n_edges_removed": n_removed,
         "n_edges_kept_training_kg": len(kept_lines),
+        "relation_id_remap_old_to_new": {
+            relation_by_id[old]: {"old_id": old, "new_id": new}
+            for old, new in sorted(new_id_of.items(), key=lambda kv: kv[1])
+        },
+        "n_relations_training_kg": len(kept_old_ids),
     }
 
 
@@ -464,7 +503,7 @@ def build_dataset(args: argparse.Namespace) -> dict[str, object]:
     holdout_info: dict[str, object]
     if getattr(args, "holdout_mode", False):
         holdout_info = apply_holdout_filter(
-            output / "kg_final.txt",
+            output,
             relation_by_id,
             HOLDOUT_DIRECT_RELATIONS,
         )

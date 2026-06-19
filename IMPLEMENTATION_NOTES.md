@@ -53,6 +53,45 @@ A new flag `--holdout_mode` on `scripts/build_cr_hkge_ready_dataset.py`.
 These counts are written to `summary.json` under the `holdout` key and printed at
 build time.
 
+### Dense relation re-numbering (required — fixes an IndexError)
+The KGAT/CR-HKGE stack assumes raw relation ids are **dense** `0..raw_n_relations-1`:
+the inverse-relation id is computed as `r_id + 2 + raw_n_relations`
+(`Model/utility/loader_kgat.py:75`) and the relation-type arrays are sized
+`len(adj_r_list)`. If hold-out merely *deleted* edges, the surviving ids would
+have gaps (0, 5, 6 missing), `raw_n_relations` would be read as `max(id)+1 = 5`
+from the remaining `{1,2,3,4}`, and the inverse ids `8,9,10,11` would index past
+the size-10 type array →
+
+```
+IndexError: index 10 is out of bounds for axis 0 with size 10
+    in CRHKGE._relation_message_multiplier_for_expanded_id()
+```
+
+So `--holdout_mode` **re-numbers the surviving relations to contiguous ids** and
+writes a matching `relation2id.txt`:
+
+| Relation | full-KG id | hold-out id | in training kg_final? |
+|---|---|---|---|
+| `has_accord` | 1 | **0** | yes |
+| `has_visual_note` | 2 | **1** | yes |
+| `belongs_to_family` | 3 | **2** | yes |
+| `sem_similar` | 4 | **3** | yes |
+| `inspired_by` | 0 | 4 | no (edge-less name only) |
+| `has_global_accord` | 5 | 5 | no (edge-less name only) |
+| `belongs_to_global_family` | 6 | 6 | no (edge-less name only) |
+
+The removed relation **names** are kept in `relation2id.txt` at ids ≥ 4 (with zero
+edges), so CR-HKGE's name lookups (`inspired_by`, `has_global_accord`,
+`belongs_to_global_family`) resolve to valid **edge-less** ids. Result:
+`enriched_products=0`, `global_attr_edges=0` — exactly the intended hold-out
+semantics, with no id-0 collision. **This is a pure data-build fix; no model code
+was changed.** The remap is recorded in `summary.json`
+(`holdout.relation_id_remap_old_to_new`).
+
+> If you already built `dataset-aromatique-crhkge-holdout` with an earlier version,
+> **rebuild it** (`--overwrite`) before training — the old folder has gapped ids
+> and will raise the IndexError above.
+
 ### The control variant
 Running the builder **without** `--holdout_mode` produces the full-KG dataset
 (`dataset-aromatique-crhkge-ready`) — this *is* the control. The two are built by
@@ -239,7 +278,8 @@ of targets/cells as positional args (e.g. `bash scripts/run_cr_hkge_holdout_stud
 | File | Meaning |
 |---|---|
 | `train.txt` / `test.txt` | Positive pairs (labels). **Identical** between full and hold-out. |
-| `kg_final.txt` | Training graph. Full = all 9250 edges; hold-out = 6759 edges (direct cross-reference edges removed). |
+| `kg_final.txt` | Training graph. Full = all 9250 edges; hold-out = 6759 edges (direct cross-reference edges removed, surviving relations re-numbered to dense ids 0–3). |
+| `relation2id.txt` | Full = original 7 ids. Hold-out = rewritten so kept relations are dense ids 0–3 and removed names sit at ids 4–6 (edge-less). |
 | `summary.json` | Dataset stats incl. `holdout` block (removed relations + counts). |
 | `positive_pair_scores.tsv` | Per-pair score audit. |
 | `profile2product.tsv` | profile → source product mapping. |

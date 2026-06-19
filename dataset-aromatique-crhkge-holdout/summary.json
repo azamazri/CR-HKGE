@@ -9,7 +9,7 @@
       "has_global_accord",
       "belongs_to_global_family"
     ],
-    "removed_relation_ids": {
+    "removed_relation_ids_in_full_kg": {
       "inspired_by": 0,
       "has_global_accord": 5,
       "belongs_to_global_family": 6
@@ -21,7 +21,38 @@
     },
     "n_edges_total_full_kg": 9250,
     "n_edges_removed": 2491,
-    "n_edges_kept_training_kg": 6759
+    "n_edges_kept_training_kg": 6759,
+    "relation_id_remap_old_to_new": {
+      "has_accord": {
+        "old_id": 1,
+        "new_id": 0
+      },
+      "has_visual_note": {
+        "old_id": 2,
+        "new_id": 1
+      },
+      "belongs_to_family": {
+        "old_id": 3,
+        "new_id": 2
+      },
+      "sem_similar": {
+        "old_id": 4,
+        "new_id": 3
+      },
+      "inspired_by": {
+        "old_id": 0,
+        "new_id": 4
+      },
+      "has_global_accord": {
+        "old_id": 5,
+        "new_id": 5
+      },
+      "belongs_to_global_family": {
+        "old_id": 6,
+        "new_id": 6
+      }
+    },
+    "n_relations_training_kg": 4
   },
   "profile_semantics": "one content/query profile per source product",
   "n_products": 340,
