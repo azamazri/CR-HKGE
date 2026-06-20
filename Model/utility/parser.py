@@ -105,6 +105,25 @@ def parse_args():
                              '(no inspired_by) receive EXACTLY the plain-KGAT update; only enriched products '
                              'get the CR-HKGE treatment. 0: disable the gate (legacy CR-HKGE where lambda_r / '
                              'relation-aware message also alter standard products).')
+    # ---- Plan C+ : residual enrichment + discriminative contrastive loss ----
+    parser.add_argument('--cr_use_residual', type=int, default=1,
+                        help='Plan C+ component 1. 1: add a learnable residual cross-reference term ONLY to '
+                             'enriched products at the FINAL embedding (KGAT message passing untouched). 0: off.')
+    parser.add_argument('--cr_residual_gamma', type=float, default=0.1,
+                        help='Plan C+ component 1. Initial value of the learnable residual scalar gamma '
+                             '(e_final = e_kgat + g_p * gamma * c_ref). gamma=0 => e_final == e_kgat (KGAT floor).')
+    parser.add_argument('--cr_use_contrastive', type=int, default=1,
+                        help='Plan C+ component 2. 1: add the discriminative contrastive auxiliary loss '
+                             '(push apart attribute-similar but reference-different products). 0: off.')
+    parser.add_argument('--cr_contrastive_weight', type=float, default=0.1,
+                        help='Plan C+ component 2. lambda_c weight on the discriminative loss in '
+                             'L_total = L_BPR + L_KG + lambda_c * L_discriminative.')
+    parser.add_argument('--cr_contrastive_margin', type=float, default=1.0,
+                        help='Plan C+ component 2. Margin m in the hinge L = mean relu(m - ||e_a - e_n||) over '
+                             '(anchor, hard-negative) pairs; pushes hard negatives at least m apart.')
+    parser.add_argument('--cr_contrastive_negs', type=int, default=5,
+                        help='Plan C+ component 2. Number of hardest (most attribute-similar) reference-different '
+                             'negatives sampled per enriched anchor.')
     parser.add_argument('--cr_relation_message_scale', nargs='?', default='type_count',
                         help='CR-HKGE only. probability: use softmax lambda directly for messages; type_count: multiply by number of relation types to preserve KGAT message scale.')
     parser.add_argument('--cr_cross_ref_alpha', type=float, default=1.0,

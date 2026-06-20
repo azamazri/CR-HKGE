@@ -35,6 +35,16 @@ class CRHKGE(KGAT):
         # Plan B: gated conditional enrichment. When on, standard products get the
         # exact plain-KGAT update; only enriched products get the CR-HKGE treatment.
         self.cr_planB_gate = bool(int(getattr(args, 'cr_planB_gate', 1)))
+
+        # Plan C+: residual enrichment (component 1) + discriminative contrastive
+        # loss (component 2). Both leave KGAT message passing untouched and are
+        # INDEPENDENTLY toggleable.
+        self.cr_use_residual = bool(int(getattr(args, 'cr_use_residual', 1)))
+        self.cr_residual_gamma_init = float(getattr(args, 'cr_residual_gamma', 0.1))
+        self.cr_use_contrastive = bool(int(getattr(args, 'cr_use_contrastive', 1)))
+        self.cr_contrastive_weight = float(getattr(args, 'cr_contrastive_weight', 0.1))
+        self.cr_contrastive_margin = float(getattr(args, 'cr_contrastive_margin', 1.0))
+        self.cr_contrastive_negs = int(getattr(args, 'cr_contrastive_negs', 5))
         self.cr_relation_message_scale = getattr(args, 'cr_relation_message_scale', 'type_count')
         self.cr_cross_ref_alpha = float(getattr(args, 'cr_cross_ref_alpha', 1.0))
         self.cr_cross_ref_bi_interaction = bool(int(getattr(args, 'cr_cross_ref_bi_interaction', 0)))
@@ -125,15 +135,13 @@ class CRHKGE(KGAT):
             self.cr_relation_type_multipliers = None
             self.cr_relation_type_message_multipliers = None
 
+        # KGAT only sets self.weights after _build_weights returns. Both the legacy
+        # cross-reference path and the Plan C+ residual need the relation embeddings
+        # while building cross-reference tensors, so expose the dict early.
+        self.weights = all_weights
+
         if self.cr_use_cross_ref:
-            # Novelty: cross-reference propagation.
-            # W_cr dan b_cr adalah transformasi khusus untuk konteks global
-            # reference sebelum disuntikkan ke embedding produk lokal.
-            #
-            # KGAT baru menetapkan self.weights setelah _build_weights selesai.
-            # CR-HKGE perlu relation embedding saat membangun attention
-            # cross-reference, jadi dictionary sementara diekspos lebih awal.
-            self.weights = all_weights
+            # Novelty: cross-reference propagation (legacy / Plan B per-layer path).
             for k in range(self.n_layers):
                 current_dim = self.weight_size_list[k]
                 all_weights['W_cr_%d' % k] = tf.Variable(
@@ -150,10 +158,26 @@ class CRHKGE(KGAT):
                     name='cr_cross_ref_gate')
             else:
                 self.cr_cross_ref_gate = tf.constant(1.0, dtype=tf.float32)
-
-            self._build_cross_ref_tensors()
         else:
             self.cr_cross_ref_gate = tf.constant(0.0, dtype=tf.float32)
+
+        # Plan C+ component 1: residual weights (final-embedding projection + gamma).
+        # Built whenever the residual is on, independent of the legacy cross-ref.
+        if self.cr_use_residual:
+            final_dim = int(sum(self.weight_size_list))
+            all_weights['W_cr_residual'] = tf.Variable(
+                initializer([final_dim, final_dim]), name='W_cr_residual')
+            all_weights['b_cr_residual'] = tf.Variable(
+                initializer([1, final_dim]), name='b_cr_residual')
+            all_weights['cr_residual_gamma'] = tf.Variable(
+                tf.constant(self.cr_residual_gamma_init, dtype=tf.float32),
+                name='cr_residual_gamma')
+            self.cr_residual_gamma = all_weights['cr_residual_gamma']
+
+        # Cross-reference TENSORS (product->global edges, masks, global-attr
+        # attention) are needed by either the legacy cross-ref OR the residual.
+        if self.cr_use_cross_ref or self.cr_use_residual:
+            self._build_cross_ref_tensors()
 
         return all_weights
 
@@ -375,6 +399,17 @@ class CRHKGE(KGAT):
         return ego_next
 
     def _create_bi_interaction_embed(self):
+        # Plan C+ wrapper: the message-passing core is UNCHANGED KGAT (when the
+        # legacy novelties are off, which is the Plan C+ configuration), then a
+        # residual is added ONLY at the final embedding. Capturing the pre-residual
+        # (pure-KGAT) embeddings lets the invariants assert standard==KGAT and the
+        # gamma=0 floor.
+        ua_kgat, ea_kgat = self._bi_interaction_core()
+        self.cr_dbg_ua_kgat = ua_kgat
+        self.cr_dbg_ea_kgat = ea_kgat
+        return self._apply_residual(ua_kgat, ea_kgat)
+
+    def _bi_interaction_core(self, gate_tensor=None):
         if not self.cr_use_cross_ref and not self.cr_relation_aware_message:
             return super(CRHKGE, self)._create_bi_interaction_embed()
 
@@ -384,13 +419,19 @@ class CRHKGE(KGAT):
         # identik dengan KGAT murni; produk ENRICHED tetap mendapat treatment CR-HKGE
         # penuh. e_p = g_p * CR_update(p) + (1 - g_p) * KGAT_update(p), dengan
         # g_p = 1 untuk enriched dan 0 untuk standard.
+        #
+        # gate_tensor: None -> primary (gated) stream using the standard-product gate.
+        # A zero gate reproduces the ORIGINAL pre-Plan-B CR-HKGE forward exactly
+        # (used only by the diagnostic to compare enriched products).
+        primary = gate_tensor is None
+
         A = self.A_in
         A_fold_hat = self._split_A_hat(A)
         relation_A_fold_hat = self._build_relation_aware_A_fold_hat()
 
         # Plan B in-graph machinery.
         kgat_A = self._build_kgat_attention_tensor()
-        standard_gate = self._standard_product_gate()        # (n_nodes, 1)
+        standard_gate = self._standard_product_gate() if primary else gate_tensor
 
         ego_embeddings = tf.concat([self.weights['user_embed'], self.weights['entity_embed']], axis=0)
         all_embeddings = [ego_embeddings]
@@ -443,9 +484,13 @@ class CRHKGE(KGAT):
             if k == 0:
                 # Invariant capture (layer 1, identical inputs for both streams):
                 # the gated update vs the pure-KGAT update from the SAME ego_0.
-                self.cr_dbg_gated_layer1 = ego_next
-                self.cr_dbg_kgat_layer1 = self._kgat_reference_layer(
-                    all_embeddings[0], kgat_A, 0)
+                if primary:
+                    self.cr_dbg_gated_layer1 = ego_next
+                    self.cr_dbg_kgat_layer1 = self._kgat_reference_layer(
+                        all_embeddings[0], kgat_A, 0)
+                else:
+                    # Ungated (original CR-HKGE) layer-1, for the enriched diagnostic.
+                    self.cr_dbg_orig_layer1 = ego_next
 
             ego_embeddings = ego_next
             norm_embeddings = tf.math.l2_normalize(ego_embeddings, axis=1)
@@ -455,6 +500,131 @@ class CRHKGE(KGAT):
 
         ua_embeddings, ea_embeddings = tf.split(all_embeddings, [self.n_users, self.n_entities], 0)
         return ua_embeddings, ea_embeddings
+
+    def _create_residual_cross_reference_context(self, node_embeddings):
+        # Plan C+ component 1. Reproduces the cross-reference context construction of
+        # `_create_cross_reference_context` (global-attribute attention -> global
+        # reference -> product, via inspired_by) but ONCE at the FINAL embedding
+        # dimension, with its own projection W_cr_residual. No lambda_r / alpha /
+        # gate confounds (gamma scales it outside). Masked to enriched products, so
+        # standard products and users/entities receive a zero residual.
+        if self.cr_global_attr_attention_tensor is not None:
+            attr_context = tf.sparse_tensor_dense_matmul(
+                self.cr_global_attr_attention_tensor, node_embeddings)
+        else:
+            attr_context = tf.zeros_like(node_embeddings)
+            for _raw_relation_id, relation_tensor in self.cr_global_attr_relation_tensors:
+                attr_context = attr_context + tf.sparse_tensor_dense_matmul(
+                    relation_tensor, node_embeddings)
+
+        global_reference_context = node_embeddings + attr_context
+        product_context = tf.sparse_tensor_dense_matmul(
+            self.cr_product_global_tensor, global_reference_context)
+
+        transformed_context = tf.nn.leaky_relu(
+            tf.matmul(product_context, self.weights['W_cr_residual']) +
+            self.weights['b_cr_residual'])
+
+        # g_p mask: nonzero only for enriched product nodes.
+        return transformed_context * self.cr_product_mask_tensor
+
+    def _apply_residual(self, ua_embeddings, ea_embeddings):
+        # e_p_final = e_p_kgat + g_p * gamma * c_ref(p), applied once at the final
+        # embedding. Safety net (Task 3): any failure here leaves the pure-KGAT
+        # embeddings untouched so the contrastive component can still run.
+        if not self.cr_use_residual:
+            return ua_embeddings, ea_embeddings
+        try:
+            full = tf.concat([ua_embeddings, ea_embeddings], axis=0)
+            c_ref = self._create_residual_cross_reference_context(full)  # already * g_p
+            full = full + self.cr_residual_gamma * c_ref
+            ua_out, ea_out = tf.split(full, [self.n_users, self.n_entities], 0)
+            self.cr_residual_active = True
+            return ua_out, ea_out
+        except Exception as exc:  # pragma: no cover - defensive toggle isolation
+            print('[Plan C+] residual disabled at build time due to: %r' % exc)
+            self.cr_residual_active = False
+            return ua_embeddings, ea_embeddings
+
+    def _build_contrastive_pairs(self):
+        # Plan C+ component 2 -- HARD-NEGATIVE sampling (ANTI-CIRCULAR).
+        # For each enriched anchor a, pick the K products n that are MOST
+        # attribute-similar (share accords/family) BUT have a DIFFERENT global
+        # reference (disjoint inspired_by target). We push a and n APART. We never
+        # add a same-reference positive (that would copy the test label) -- see
+        # IMPLEMENTATION_NOTES_PLANCPLUS.md for the non-circularity argument.
+        def _as_set(mapping, key):
+            value = mapping.get(key, mapping.get(str(key), []))
+            return set(int(v) for v in value)
+
+        accords = self.cr_config.get('product_accords', {})
+        families = self.cr_config.get('product_families', {})
+        refs = self.cr_config.get('product_to_global_ref', {})
+        enriched = sorted(int(p) for p in self.cr_config.get('enriched_product_ids', []))
+
+        anchors, negatives = [], []
+        for anchor in enriched:
+            anchor_attr = _as_set(accords, anchor) | _as_set(families, anchor)
+            anchor_ref = _as_set(refs, anchor)
+            if not anchor_attr or not anchor_ref:
+                continue
+            candidates = []
+            for other in range(self.n_items):
+                if other == anchor:
+                    continue
+                other_ref = _as_set(refs, other)
+                if anchor_ref & other_ref:
+                    continue  # same global reference -> NOT a hard negative
+                other_attr = _as_set(accords, other) | _as_set(families, other)
+                overlap = anchor_attr & other_attr
+                if overlap:
+                    jaccard = len(overlap) / len(anchor_attr | other_attr)
+                    candidates.append((jaccard, other))
+            candidates.sort(key=lambda row: (-row[0], row[1]))
+            for _jaccard, other in candidates[:self.cr_contrastive_negs]:
+                anchors.append(anchor)
+                negatives.append(other)
+
+        self.cr_contrastive_anchor_ids = np.asarray(anchors, dtype=np.int32)
+        self.cr_contrastive_neg_ids = np.asarray(negatives, dtype=np.int32)
+        return self.cr_contrastive_anchor_ids, self.cr_contrastive_neg_ids
+
+    def _build_contrastive_loss(self):
+        # Margin-based hinge repulsion over (anchor, hard-negative) pairs:
+        #   L = mean relu(margin - ||e_a - e_n||_2)
+        # Pushes attribute-similar-but-reference-different products at least
+        # `margin` apart. Returns 0 if disabled or no enriched anchors exist
+        # (e.g. on a hold-out KG with inspired_by removed).
+        anchor_ids, neg_ids = self._build_contrastive_pairs()
+        self.cr_n_contrastive_pairs = int(len(anchor_ids))
+        if len(anchor_ids) == 0:
+            return tf.constant(0.0, dtype=tf.float32)
+
+        anchor_e = tf.gather(self.ea_embeddings, tf.constant(anchor_ids, dtype=tf.int32))
+        neg_e = tf.gather(self.ea_embeddings, tf.constant(neg_ids, dtype=tf.int32))
+        dist = tf.sqrt(tf.reduce_sum(tf.square(anchor_e - neg_e), axis=1) + 1e-12)
+        return tf.reduce_mean(tf.nn.relu(self.cr_contrastive_margin - dist))
+
+    def _build_loss_phase_I(self):
+        # Reuse KGAT's BPR + KG + reg loss EXACTLY, then add the discriminative
+        # contrastive term and rebuild the optimizer over the combined loss.
+        super(CRHKGE, self)._build_loss_phase_I()
+
+        self.cr_contrastive_loss = tf.constant(0.0, dtype=tf.float32)
+        self.cr_n_contrastive_pairs = 0
+        if self.cr_use_contrastive:
+            try:
+                self.cr_contrastive_loss = self._build_contrastive_loss()
+                self.loss = self.loss + self.cr_contrastive_weight * self.cr_contrastive_loss
+                # Rebuild the optimizer over L_BPR + L_KG + lambda_c * L_disc.
+                self.opt = tf.train.AdamOptimizer(learning_rate=self.lr).minimize(self.loss)
+                print('[Plan C+] contrastive loss active: %d hard-negative pairs, '
+                      'lambda_c=%.3f, margin=%.2f' % (
+                          self.cr_n_contrastive_pairs, self.cr_contrastive_weight,
+                          self.cr_contrastive_margin))
+            except Exception as exc:  # pragma: no cover - defensive toggle isolation
+                print('[Plan C+] contrastive disabled at build time due to: %r' % exc)
+                self.cr_contrastive_loss = tf.constant(0.0, dtype=tf.float32)
 
     def _build_relation_aware_A_fold_hat(self):
         # Menyiapkan adjacency per relasi untuk relation-aware message.
@@ -583,6 +753,146 @@ class CRHKGE(KGAT):
             % (std_diff, tol))
         return result
 
+    def build_planB_enriched_diagnostic(self):
+        """Build a parallel UNGATED (== original CR-HKGE) stream sharing the SAME
+        weights as the gated model, so we can compare enriched products
+        gated-vs-original both at layer 1 and at the full multi-layer output.
+
+        Must be called once after construction (adds graph tensors only; does not
+        touch training).
+        """
+        n_nodes = self.n_users + self.n_entities
+        zero_gate = tf.zeros((n_nodes, 1), dtype=tf.float32)
+        # gate_tensor=zero_gate -> side = side_cr for every node, cross_ref unmasked
+        # by the gate == the original pre-Plan-B CR-HKGE forward.
+        _ua_orig, ea_orig = self._bi_interaction_core(gate_tensor=zero_gate)
+        self.cr_dbg_full_orig_ea = ea_orig
+        self.cr_dbg_full_gated_ea = self.ea_embeddings
+        return self
+
+    def check_enriched_equals_original(self, sess, tol=1e-5, verbose=True):
+        """Plan B enriched invariant.
+
+        Verifies whether, for ENRICHED products (cr_product_mask=1), the gated
+        CR-HKGE-B output equals the ORIGINAL CR-HKGE output. Reports two levels:
+          - layer 1 (identical inputs): expected to PASS by construction.
+          - full multi-layer entity embedding: this is what feeds predictions.
+        Returns a dict; does NOT raise (diagnostic only).
+        """
+        if not hasattr(self, 'cr_dbg_full_orig_ea'):
+            self.build_planB_enriched_diagnostic()
+
+        feed = {
+            self.mess_dropout: [0.] * self.n_layers,
+            self.node_dropout: [0.] * self.n_layers,
+        }
+        gated_l1, orig_l1, gated_ea, orig_ea = sess.run(
+            [self.cr_dbg_gated_layer1, self.cr_dbg_orig_layer1,
+             self.cr_dbg_full_gated_ea, self.cr_dbg_full_orig_ea],
+            feed_dict=feed)
+
+        enriched_items = sorted(int(i) for i in self.cr_config.get('enriched_product_ids', []))
+        enriched_nodes = [self.n_users + i for i in enriched_items]
+
+        # Layer 1: compare full-node tensors on enriched product NODES.
+        l1_diff = 0.0
+        if enriched_nodes:
+            l1_diff = float(np.max(np.abs(gated_l1[enriched_nodes] - orig_l1[enriched_nodes])))
+        # Full: compare entity embeddings on enriched product item rows.
+        full_diff = 0.0
+        per_layer_note = ''
+        if enriched_items:
+            full_diff = float(np.max(np.abs(gated_ea[enriched_items] - orig_ea[enriched_items])))
+
+        result = {
+            'n_enriched_products': len(enriched_items),
+            'max_abs_diff_enriched_layer1': l1_diff,
+            'max_abs_diff_enriched_full': full_diff,
+            'tolerance': tol,
+            'layer1_pass': l1_diff <= tol,
+            'full_pass': full_diff <= tol,
+        }
+        if verbose:
+            print('[Plan B enriched] enriched products: %d' % len(enriched_items))
+            print('[Plan B enriched] LAYER 1   max|gated - original| = %.3e -> %s'
+                  % (l1_diff, 'PASS' if result['layer1_pass'] else 'FAIL'))
+            print('[Plan B enriched] FULL (%dL) max|gated - original| = %.3e -> %s'
+                  % (self.n_layers, full_diff, 'PASS' if result['full_pass'] else 'FAIL'))
+        return result
+
+    def build_planCplus_diagnostic(self):
+        # Independent pure-KGAT reference embedding (SAME weights, SAME A_in) used to
+        # prove invariant (c): the KGAT propagation is byte-identical.
+        _ua_ref, ea_ref = super(CRHKGE, self)._create_bi_interaction_embed()
+        self.cr_dbg_ea_kgat_ref = ea_ref
+        return self
+
+    def check_planCplus_invariants(self, sess, tol=1e-6, verbose=True):
+        """Plan C+ invariants (a)(b)(c) on a synthetic forward (dropout = 0).
+
+        (a) standard products: e_final == e_kgat exactly.
+        (c) KGAT propagation byte-identical to original KGAT (pre-residual stream
+            equals an independent pure-KGAT stream with the same weights).
+        (b) is the gamma=0 floor: run this with --cr_residual_gamma 0
+            --cr_use_contrastive 0 and EVERY product (not just standard) matches
+            e_kgat. Reported as the all-product diff here.
+
+        Asserts (a) and (c); returns a dict. Does not require training.
+        """
+        if not hasattr(self, 'cr_dbg_ea_kgat_ref'):
+            self.build_planCplus_diagnostic()
+
+        feed = {
+            self.mess_dropout: [0.] * self.n_layers,
+            self.node_dropout: [0.] * self.n_layers,
+        }
+        ea_kgat, ea_final, ea_ref = sess.run(
+            [self.cr_dbg_ea_kgat, self.ea_embeddings, self.cr_dbg_ea_kgat_ref],
+            feed_dict=feed)
+
+        enriched = set(int(i) for i in self.cr_config.get('enriched_product_ids', []))
+        standard = [i for i in range(self.n_items) if i not in enriched]
+        enriched_items = sorted(enriched)
+        all_items = list(range(self.n_items))
+
+        def _maxdiff(rows):
+            if not rows:
+                return 0.0
+            return float(np.max(np.abs(ea_final[rows] - ea_kgat[rows])))
+
+        a_diff = _maxdiff(standard)                         # invariant (a)
+        b_diff = _maxdiff(all_items)                        # invariant (b) floor
+        enr_diff = _maxdiff(enriched_items)                 # residual magnitude
+        c_diff = float(np.max(np.abs(ea_kgat - ea_ref)))    # invariant (c)
+
+        result = {
+            'n_enriched_products': len(enriched_items),
+            'n_standard_products': len(standard),
+            'invariant_a_standard_eq_kgat': a_diff,
+            'invariant_b_allproducts_eq_kgat_floor': b_diff,
+            'invariant_c_propagation_eq_kgat': c_diff,
+            'residual_magnitude_on_enriched': enr_diff,
+            'tolerance': tol,
+            'residual_gamma_init': self.cr_residual_gamma_init,
+        }
+        if verbose:
+            print('[Plan C+ inv a] standard products == KGAT     : max diff %.3e -> %s'
+                  % (a_diff, 'PASS' if a_diff <= tol else 'FAIL'))
+            print('[Plan C+ inv c] KGAT propagation byte-identical: max diff %.3e -> %s'
+                  % (c_diff, 'PASS' if c_diff <= tol else 'FAIL'))
+            print('[Plan C+ inv b] ALL products == KGAT (floor; only when gamma=0): max diff %.3e %s'
+                  % (b_diff, '-> PASS' if b_diff <= tol else '(expected > 0 when gamma != 0)'))
+            print('[Plan C+      ] residual magnitude on enriched : %.3e (gamma_init=%.3f)'
+                  % (enr_diff, self.cr_residual_gamma_init))
+
+        assert a_diff <= tol, (
+            'Invariant (a) VIOLATED: standard products deviate from KGAT by %.3e > %.1e'
+            % (a_diff, tol))
+        assert c_diff <= tol, (
+            'Invariant (c) VIOLATED: KGAT propagation differs by %.3e > %.1e'
+            % (c_diff, tol))
+        return result
+
     def export_artifacts(self, sess, args, data_generator, final_perf):
         # Fase akhir setelah training:
         # export artifact untuk serving/retrieval dan integrasi dengan sistem
@@ -655,6 +965,15 @@ class CRHKGE(KGAT):
             'cr_relation_aware_message': self.cr_relation_aware_message,
             'cr_relation_message_scale': self.cr_relation_message_scale,
             'cr_planB_gate': self.cr_planB_gate,
+            'cr_use_residual': self.cr_use_residual,
+            'cr_residual_gamma_init': self.cr_residual_gamma_init,
+            'cr_residual_gamma_value': (float(sess.run(self.cr_residual_gamma))
+                                        if self.cr_use_residual else 0.0),
+            'cr_use_contrastive': self.cr_use_contrastive,
+            'cr_contrastive_weight': self.cr_contrastive_weight,
+            'cr_contrastive_margin': self.cr_contrastive_margin,
+            'cr_contrastive_negs': self.cr_contrastive_negs,
+            'cr_n_contrastive_pairs': int(getattr(self, 'cr_n_contrastive_pairs', 0)),
             'cr_cross_ref_alpha': self.cr_cross_ref_alpha,
             'cr_cross_ref_bi_interaction': self.cr_cross_ref_bi_interaction,
             'cr_cross_ref_gate': self.cr_cross_ref_gate_enabled,

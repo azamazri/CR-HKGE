@@ -290,10 +290,24 @@ class KGAT_loader(Data):
         global_ref_to_attributes = collections.defaultdict(list)
         enriched_product_ids = set()
 
+        # Per-product local attribute sets, used by Plan C+ to sample HARD NEGATIVES
+        # for the discriminative contrastive loss (attribute-similar but
+        # reference-different products). On a hold-out KG these attribute relations
+        # are kept, but inspired_by is absent so there are no enriched anchors.
+        has_accord_id = name_to_relation_id.get('has_accord')
+        belongs_to_family_id = name_to_relation_id.get('belongs_to_family')
+        product_accords = collections.defaultdict(set)
+        product_families = collections.defaultdict(set)
+
         for head, relation, tail in self.kg_data:
             head = int(head)
             relation = int(relation)
             tail = int(tail)
+
+            if head < self.n_items and relation == has_accord_id:
+                product_accords[head].add(tail)
+            if head < self.n_items and relation == belongs_to_family_id:
+                product_families[head].add(tail)
 
             if relation == inspired_by_id and head < self.n_items:
                 # Edge inspired_by adalah inti novelty cross-reference.
@@ -374,6 +388,8 @@ class KGAT_loader(Data):
             'enriched_product_ids': sorted(enriched_product_ids),
             'product_to_global_ref': {k: sorted(v) for k, v in product_to_global_ref.items()},
             'global_ref_to_attributes': {k: v for k, v in global_ref_to_attributes.items()},
+            'product_accords': {k: sorted(v) for k, v in product_accords.items()},
+            'product_families': {k: sorted(v) for k, v in product_families.items()},
         }
 
     def get_cr_hkge_config(self):
